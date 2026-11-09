@@ -1,5 +1,5 @@
 --[[
-  FLUFFY HUB v1.1 - versi Delta Executor (Android)
+  FLUFFY HUB v1.2 - versi Delta Executor (Android)
 
   Cara pakai:
     1. (Opsional) tambahkan di baris paling atas:
@@ -20,7 +20,7 @@ local script_key = "FLUFFY-DEMO-0000" -- key contoh (format: FLUFFY-XXXX-XXXX)
 local REQUIRE_KEY = false             -- true = script berhenti jika key tidak valid
 local KEY_API_URL = ""                -- opsional: server cek key milikmu (balasan JSON {"valid":true})
 local USE_EMOJI = true                -- false jika emoji tampil sebagai kotak
-local VERSION = "1.1"
+local VERSION = "1.2"
 
 -- ============================================================
 -- [1] SERVICE, ENV, ANTI EKSEKUSI GANDA
@@ -805,13 +805,13 @@ end
 -- [5] STATE (data murni, terpisah dari UI)
 -- ============================================================
 local State = {
-    PNB = { Enabled = false, Block = "Sugar Cane [954]", BlockId = 954, Mode = "PNB Only", Placed = 0, Broken = 0,
+    PNB = { TileDir = "Otomatis", StartX = 1, OffsetY = 0, Rows = 1, Enabled = false, Block = "Sugar Cane [954]", BlockId = 954, Mode = "PNB Only", Placed = 0, Broken = 0,
             Batch = 0, DropsLeft = 0, BatchSize = 3, Hits = 3, Delay = 0.15, Status = "Idle", Spot = nil },
     Clear = { Enabled = false, Mode = "Area", Width = 5, Height = 5, Hits = 3, Delay = 0.15, Cleared = 0,
               Status = "Idle", Spot = nil },
-    Dirt = { Enabled = false, Block = "Dirt [2]", BlockId = 2, Mode = "PNB Dirt", AutoCollect = true, Placed = 0,
+    Dirt = { TileDir = "Otomatis", StartX = 1, OffsetY = 0, Rows = 1, Enabled = false, Block = "Dirt [2]", BlockId = 2, Mode = "PNB Dirt", AutoCollect = true, Placed = 0,
              Broken = 0, Batch = 0, DropsLeft = 0, BatchSize = 3, Hits = 3, Delay = 0.15, Status = "Idle", Spot = nil },
-    Farm = { Enabled = false, Seed = "Sugar Cane Seed [955]", SeedId = 955, Mode = "Plant & Harvest", Width = 5,
+    Farm = { TileDir = "Otomatis", StartX = 1, OffsetY = 0, Rows = 1, Enabled = false, Seed = "Sugar Cane Seed [955]", SeedId = 955, Mode = "Plant & Harvest", Width = 5,
              GrowTime = 30, Delay = 0.15, AutoCollect = true, Planted = 0, Harvested = 0, Status = "Idle", Spot = nil },
     Webhook = { Enabled = false, Url = "", Interval = 5, Sent = 0, Status = "Idle" },
     Utils = { AntiAFK = false },
@@ -1049,16 +1049,28 @@ local function ResetSpot(s, counters)
     if ResolveOrigin(s) then s.Status = "Spot baru disimpan" else s.Status = "Karakter tidak ditemukan" end
 end
 
+-- Susun daftar tile target dari pengaturan tile (arah, mulai, offset Y, baris)
+local function BuildTargets(s, count)
+    local ox, oy, dir = ResolveOrigin(s)
+    if not ox then return nil end
+    if s.TileDir == "Kiri" then dir = -1 elseif s.TileDir == "Kanan" then dir = 1 end
+    local targets = {}
+    for r = 0, s.Rows - 1 do
+        for i = 0, count - 1 do
+            table.insert(targets, { ox + dir * (s.StartX + i), oy + s.OffsetY - r })
+        end
+    end
+    return targets
+end
+
 -- Satu siklus pasang + hancurkan (dipakai PNB & Dirt Farm)
 local function PlaceBreakCycle(s, alive, blockId, doPlace, doBreak)
-    local ox, oy, dir = ResolveOrigin(s)
-    if not ox then
+    local targets = BuildTargets(s, s.BatchSize)
+    if not targets then
         s.Status = "Karakter tidak ditemukan"
         task.wait(1)
         return false
     end
-    local targets = {}
-    for i = 1, s.BatchSize do table.insert(targets, { ox + dir * i, oy }) end
     if doPlace then
         s.Status = "Memasang block"
         for _, t in ipairs(targets) do
@@ -1095,7 +1107,7 @@ PNB = CreateModule(State.PNB, function(alive)
     if not RequireRemotes(PNB, need) then return end
     if doPlace then
         local stock = Actions.GetInventoryCount(s.BlockId)
-        if stock ~= nil and stock < s.BatchSize then
+        if stock ~= nil and stock < s.BatchSize * s.Rows then
             PNB.SetEnabled(false, "Stok block habis")
             return
         end
@@ -1152,7 +1164,7 @@ Dirt = CreateModule(State.Dirt, function(alive)
     if s.Mode == "PNB Dirt" then
         if not RequireRemotes(Dirt, { "Place", "Break" }) then return end
         local stock = Actions.GetInventoryCount(s.BlockId)
-        if stock ~= nil and stock < s.BatchSize then
+        if stock ~= nil and stock < s.BatchSize * s.Rows then
             Dirt.SetEnabled(false, "Stok dirt habis")
             return
         end
@@ -1178,14 +1190,12 @@ Farm = CreateModule(State.Farm, function(alive)
     if doPlant then table.insert(need, "Plant") end
     if doHarvest then table.insert(need, "Harvest") end
     if not RequireRemotes(Farm, need) then return end
-    local ox, oy, dir = ResolveOrigin(s)
-    if not ox then
+    local targets = BuildTargets(s, s.Width)
+    if not targets then
         s.Status = "Karakter tidak ditemukan"
         task.wait(1)
         return
     end
-    local targets = {}
-    for i = 1, s.Width do table.insert(targets, { ox + dir * i, oy }) end
     if doPlant then
         s.Status = "Menanam"
         for _, t in ipairs(targets) do
@@ -1291,17 +1301,68 @@ local function SetAntiAFK(v)
     end
 end
 
-local function ScanRemotes()
+local REMOTE_KEYWORDS = { "place", "break", "hit", "punch", "fist", "build", "destroy", "plant", "harvest",
+    "collect", "pickup", "drop", "tile", "block", "seed" }
+
+local function CollectRemoteLines(filtered)
     local lines = {}
-    for _, d in ipairs(RS:GetDescendants()) do
-        if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
-            table.insert(lines, d.ClassName .. " : " .. d:GetFullName())
+    local function scan(root)
+        for _, d in ipairs(root:GetDescendants()) do
+            if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+                local full = d:GetFullName()
+                local keep = not filtered
+                if filtered then
+                    local low = full:lower()
+                    for _, k in ipairs(REMOTE_KEYWORDS) do
+                        if low:find(k, 1, true) then keep = true break end
+                    end
+                end
+                if keep then table.insert(lines, d.ClassName .. " : " .. full) end
+            end
         end
     end
+    scan(RS)
+    pcall(scan, workspace)
+    return lines
+end
+
+local function ScanRemotes(filtered)
+    local lines = CollectRemoteLines(filtered)
     print("[Fluffy Hub] Daftar Remote (" .. #lines .. ")")
     for _, l in ipairs(lines) do print(l) end
     if typeof(setclipboard) == "function" then pcall(setclipboard, table.concat(lines, "\n")) end
     return #lines
+end
+
+-- Kirim daftar remote ke webhook Discord milikmu (dipecah per ~1800 karakter)
+local function SendRemotesToWebhook(filtered)
+    local url = State.Webhook.Url
+    if not IsDiscordWebhook(url) then return false, "Isi Webhook URL dulu di tab Webhook" end
+    local lines = CollectRemoteLines(filtered)
+    if #lines == 0 then return false, "Tidak ada remote ditemukan" end
+    local chunk, sent = "", 0
+    local function flush()
+        if chunk == "" then return true end
+        local res, err = HttpRequest({
+            Url = url, Method = "POST", Headers = { ["Content-Type"] = "application/json" },
+            Body = HttpService:JSONEncode({ username = "Fluffy Hub", content = "```\n" .. chunk .. "```" }),
+        })
+        chunk = ""
+        sent = sent + 1
+        task.wait(1.2)
+        if not res then return false, err end
+        return true
+    end
+    for _, l in ipairs(lines) do
+        if #chunk + #l + 1 > 1800 then
+            local ok, e = flush()
+            if not ok then return false, e end
+        end
+        chunk = chunk .. l .. "\n"
+    end
+    local ok, e = flush()
+    if not ok then return false, e end
+    return true, #lines .. " remote dalam " .. sent .. " pesan"
 end
 
 -- ============================================================
@@ -1316,6 +1377,17 @@ local function BuildUI()
         for _, r in ipairs(rows) do
             table.insert(Binds, { tab = tab, kv = sec:CreateKeyValue(r[1], "-"), get = r[2], last = nil })
         end
+    end
+    -- Pengaturan tile (dipakai tab PNB, Dirt Farm, Farm)
+    local function TileControls(sec, st, pre)
+        sec:CreateDropdown({ Name = "Arah tile", Options = { "Otomatis", "Kiri", "Kanan" }, Default = "Otomatis",
+            Flag = pre .. "_tdir", Callback = function(v) st.TileDir = v end })
+        sec:CreateSlider({ Name = "Mulai dari tile ke-", Min = 1, Max = 10, Step = 1, Default = 1,
+            Flag = pre .. "_tstart", Callback = function(v) st.StartX = v end })
+        sec:CreateSlider({ Name = "Offset baris (Y)", Min = -5, Max = 5, Step = 1, Default = 0,
+            Flag = pre .. "_toffy", Callback = function(v) st.OffsetY = v end })
+        sec:CreateSlider({ Name = "Jumlah baris", Min = 1, Max = 5, Step = 1, Default = 1,
+            Flag = pre .. "_trows", Callback = function(v) st.Rows = v end })
     end
     local function Link(module, toggle)
         module.OnChange = function(v) toggle:Set(v, true) end
@@ -1365,6 +1437,7 @@ local function BuildUI()
             Callback = function(v) State.PNB.BatchSize = v end })
         sec:CreateSlider({ Name = "Hit per block", Min = 1, Max = 6, Step = 1, Default = 3, Flag = "pnb_hits",
             Callback = function(v) State.PNB.Hits = v end })
+        TileControls(sec, State.PNB, "pnb")
         sec:CreateSlider({ Name = "Delay", Min = 0.05, Max = 1, Step = 0.05, Default = 0.15, Suffix = "s",
             Flag = "pnb_delay", Callback = function(v) State.PNB.Delay = v end })
         sec:CreateButton({ Name = "Reset PNB Spot", Callback = function()
@@ -1378,6 +1451,7 @@ local function BuildUI()
             { "Terpasang", function() return p.Placed end },
             { "Dihancurkan", function() return p.Broken end },
             { "Batch", function() return p.Batch end },
+            { "Tile target", function() return p.BatchSize * p.Rows end },
             { "Drop tersisa", function() return p.DropsLeft end },
         })
     end
@@ -1425,6 +1499,7 @@ local function BuildUI()
             Callback = function(v) State.Dirt.AutoCollect = v end })
         sec:CreateSlider({ Name = "Tile per batch", Min = 1, Max = 8, Step = 1, Default = 3, Flag = "dirt_batch",
             Callback = function(v) State.Dirt.BatchSize = v end })
+        TileControls(sec, State.Dirt, "dirt")
         sec:CreateSlider({ Name = "Delay", Min = 0.05, Max = 1, Step = 0.05, Default = 0.15, Suffix = "s",
             Flag = "dirt_delay", Callback = function(v) State.Dirt.Delay = v end })
         sec:CreateButton({ Name = "Reset Spot Dirt", Callback = function()
@@ -1459,6 +1534,7 @@ local function BuildUI()
             Callback = function(v) State.Farm.AutoCollect = v end })
         sec:CreateSlider({ Name = "Jumlah tile", Min = 1, Max = 12, Step = 1, Default = 5, Flag = "farm_w",
             Callback = function(v) State.Farm.Width = v end })
+        TileControls(sec, State.Farm, "farm")
         sec:CreateSlider({ Name = "Waktu tumbuh", Min = 5, Max = 300, Step = 5, Default = 30, Suffix = "s",
             Flag = "farm_grow", Callback = function(v) State.Farm.GrowTime = v end })
         sec:CreateSlider({ Name = "Delay", Min = 0.05, Max = 1, Step = 0.05, Default = 0.15, Suffix = "s",
@@ -1516,6 +1592,19 @@ local function BuildUI()
             Notify("Fluffy Hub", ScanRemotes() .. " remote ditemukan (lihat console)", 4)
         end })
         dev:CreateLabel("Mencetak semua RemoteEvent/RemoteFunction di ReplicatedStorage untuk mengisi GameConfig.Remotes.")
+        dev:CreateButton({ Name = "Kirim Remote ke Webhook (filter)", Callback = function()
+            Fire(function()
+                local ok, info = SendRemotesToWebhook(true)
+                Notify("Fluffy Hub", ok and ("Terkirim: " .. tostring(info)) or ("Gagal: " .. tostring(info)), 5)
+            end)
+        end })
+        dev:CreateButton({ Name = "Kirim Semua Remote ke Webhook", Callback = function()
+            Fire(function()
+                local ok, info = SendRemotesToWebhook(false)
+                Notify("Fluffy Hub", ok and ("Terkirim: " .. tostring(info)) or ("Gagal: " .. tostring(info)), 5)
+            end)
+        end })
+        dev:CreateLabel("Isi dulu Webhook URL di tab Webhook. Hasil muncul di channel Discord-mu, tinggal disalin.")
     end
 
     -- Loop status ringan: hanya update tab yang terlihat
