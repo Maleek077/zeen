@@ -1,5 +1,5 @@
 --[[
-  FLUFFY HUB v1.2 - versi Delta Executor (Android)
+  FLUFFY HUB v1.3 - versi Delta Executor (Android)
 
   Cara pakai:
     1. (Opsional) tambahkan di baris paling atas:
@@ -20,7 +20,7 @@ local script_key = "FLUFFY-DEMO-0000" -- key contoh (format: FLUFFY-XXXX-XXXX)
 local REQUIRE_KEY = false             -- true = script berhenti jika key tidak valid
 local KEY_API_URL = ""                -- opsional: server cek key milikmu (balasan JSON {"valid":true})
 local USE_EMOJI = true                -- false jika emoji tampil sebagai kotak
-local VERSION = "1.2"
+local VERSION = "1.3"
 
 -- ============================================================
 -- [1] SERVICE, ENV, ANTI EKSEKUSI GANDA
@@ -1334,12 +1334,11 @@ local function ScanRemotes(filtered)
     return #lines
 end
 
--- Kirim daftar remote ke webhook Discord milikmu (dipecah per ~1800 karakter)
-local function SendRemotesToWebhook(filtered)
+-- Kirim baris teks ke webhook Discord milikmu (dipecah per ~1800 karakter)
+local function SendLinesToWebhook(lines)
     local url = State.Webhook.Url
     if not IsDiscordWebhook(url) then return false, "Isi Webhook URL dulu di tab Webhook" end
-    local lines = CollectRemoteLines(filtered)
-    if #lines == 0 then return false, "Tidak ada remote ditemukan" end
+    if #lines == 0 then return false, "Tidak ada data" end
     local chunk, sent = "", 0
     local function flush()
         if chunk == "" then return true end
@@ -1362,8 +1361,106 @@ local function SendRemotesToWebhook(filtered)
     end
     local ok, e = flush()
     if not ok then return false, e end
-    return true, #lines .. " remote dalam " .. sent .. " pesan"
+    return true, #lines .. " baris dalam " .. sent .. " pesan"
 end
+
+local function SendRemotesToWebhook(filtered)
+    return SendLinesToWebhook(CollectRemoteLines(filtered))
+end
+
+-- Perekam aksi: mencatat remote yang dikirim GAME saat kamu melakukan 1 aksi manual
+-- (pasang / pukul block), supaya nama remote + argumennya bisa dipakai di GameConfig.
+-- Remote bernama AdminRemotes selalu diabaikan.
+local Recorder = ENV.FluffyRecorder or { Active = false, Hooked = false, Busy = false, Order = {}, Map = {} }
+ENV.FluffyRecorder = Recorder
+
+local function Ser(v, depth)
+    local t = typeof(v)
+    if t == "string" then return string.format("%q", v) end
+    if t == "number" or t == "boolean" or t == "nil" then return tostring(v) end
+    if t == "Instance" then return "Instance(" .. v:GetFullName() .. ")" end
+    if t == "Vector3" or t == "Vector2" or t == "CFrame" or t == "Color3" or t == "UDim2" then
+        return t .. "(" .. tostring(v) .. ")"
+    end
+    if t == "buffer" then return "buffer(len=" .. tostring(buffer.len(v)) .. ")" end
+    if t == "table" then
+        if depth >= 2 then return "{...}" end
+        local parts, n = {}, 0
+        for k, x in pairs(v) do
+            n = n + 1
+            if n > 8 then
+                table.insert(parts, "...")
+                break
+            end
+            table.insert(parts, "[" .. Ser(k, depth + 1) .. "]=" .. Ser(x, depth + 1))
+        end
+        return "{" .. table.concat(parts, ", ") .. "}"
+    end
+    return t
+end
+
+local function RecordCall(remote, args)
+    local okName, full = pcall(function() return remote:GetFullName() end)
+    if not okName then return end
+    if full:find("AdminRemotes", 1, true) then return end
+    local parts = {}
+    for i = 1, args.n do
+        local ok, str = pcall(Ser, args[i], 0)
+        table.insert(parts, ok and str or "?")
+    end
+    local sig = remote.ClassName .. " : " .. full .. " (" .. table.concat(parts, ", ") .. ")"
+    local e = Recorder.Map[sig]
+    if e then
+        e.count = e.count + 1
+        return
+    end
+    if #Recorder.Order >= 80 then return end
+    e = { sig = sig, count = 1 }
+    Recorder.Map[sig] = e
+    table.insert(Recorder.Order, e)
+end
+
+local function StartRecording()
+    if typeof(hookmetamethod) ~= "function" or typeof(getnamecallmethod) ~= "function" then
+        return false, "Executor tidak mendukung hookmetamethod"
+    end
+    Recorder.Order, Recorder.Map = {}, {}
+    if not Recorder.Hooked then
+        local old
+        local function handler(self, ...)
+            local method = getnamecallmethod()
+            if Recorder.Active and not Recorder.Busy and (method == "FireServer" or method == "InvokeServer") then
+                local mine = typeof(checkcaller) == "function" and checkcaller()
+                if not mine then
+                    Recorder.Busy = true
+                    local args = table.pack(...)
+                    pcall(RecordCall, self, args)
+                    Recorder.Busy = false
+                end
+            end
+            return old(self, ...)
+        end
+        if typeof(newcclosure) == "function" then handler = newcclosure(handler) end
+        local ok, res = pcall(hookmetamethod, game, "__namecall", handler)
+        if not ok then return false, tostring(res) end
+        old = res
+        Recorder.Hooked = true
+    end
+    Recorder.Active = true
+    return true
+end
+
+local function StopAndSendRecording()
+    Recorder.Active = false
+    local lines = {}
+    for _, e in ipairs(Recorder.Order) do
+        table.insert(lines, "x" .. e.count .. "  " .. e.sig)
+    end
+    for _, l in ipairs(lines) do print("[Fluffy Hub] " .. l) end
+    if #lines == 0 then return false, "Tidak ada aksi terekam" end
+    return SendLinesToWebhook(lines)
+end
+Library.Maid:Add(function() Recorder.Active = false end)
 
 -- ============================================================
 -- [8] MEMBANGUN UI
@@ -1605,6 +1702,17 @@ local function BuildUI()
             end)
         end })
         dev:CreateLabel("Isi dulu Webhook URL di tab Webhook. Hasil muncul di channel Discord-mu, tinggal disalin.")
+        dev:CreateButton({ Name = "Mulai Rekam Aksi", Callback = function()
+            local ok, info = StartRecording()
+            Notify("Fluffy Hub", ok and "Merekam. Diam di tempat, lakukan 1 aksi, lalu tekan Stop & Kirim" or ("Gagal: " .. tostring(info)), 6)
+        end })
+        dev:CreateButton({ Name = "Stop & Kirim Rekaman", Callback = function()
+            Fire(function()
+                local ok, info = StopAndSendRecording()
+                Notify("Fluffy Hub", ok and ("Terkirim: " .. tostring(info)) or ("Gagal: " .. tostring(info)), 5)
+            end)
+        end })
+        dev:CreateLabel("Rekam: tekan Mulai, diam di tempat, pasang ATAU pukul 1 block, lalu Stop & Kirim. Ulangi untuk aksi lain.")
     end
 
     -- Loop status ringan: hanya update tab yang terlihat
