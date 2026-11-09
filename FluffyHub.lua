@@ -1,5 +1,5 @@
 --[[
-  FLUFFY HUB v1.3 - versi Delta Executor (Android)
+  FLUFFY HUB v1.4 - versi Delta Executor (Android)
 
   Cara pakai:
     1. (Opsional) tambahkan di baris paling atas:
@@ -20,7 +20,7 @@ local script_key = "FLUFFY-DEMO-0000" -- key contoh (format: FLUFFY-XXXX-XXXX)
 local REQUIRE_KEY = false             -- true = script berhenti jika key tidak valid
 local KEY_API_URL = ""                -- opsional: server cek key milikmu (balasan JSON {"valid":true})
 local USE_EMOJI = true                -- false jika emoji tampil sebagai kotak
-local VERSION = "1.3"
+local VERSION = "1.4"
 
 -- ============================================================
 -- [1] SERVICE, ENV, ANTI EKSEKUSI GANDA
@@ -1371,8 +1371,8 @@ end
 -- Perekam aksi: mencatat remote yang dikirim GAME saat kamu melakukan 1 aksi manual
 -- (pasang / pukul block), supaya nama remote + argumennya bisa dipakai di GameConfig.
 -- Remote bernama AdminRemotes selalu diabaikan.
-local Recorder = ENV.FluffyRecorder or { Active = false, Hooked = false, Busy = false, Order = {}, Map = {} }
-ENV.FluffyRecorder = Recorder
+local Recorder = ENV.FluffyRecorderV2 or { Active = false, Hooked = false, Busy = false, Count = 0, Order = {}, Map = {} }
+ENV.FluffyRecorderV2 = Recorder
 
 local function Ser(v, depth)
     local t = typeof(v)
@@ -1382,7 +1382,14 @@ local function Ser(v, depth)
     if t == "Vector3" or t == "Vector2" or t == "CFrame" or t == "Color3" or t == "UDim2" then
         return t .. "(" .. tostring(v) .. ")"
     end
-    if t == "buffer" then return "buffer(len=" .. tostring(buffer.len(v)) .. ")" end
+    if t == "buffer" then
+        local n = buffer.len(v)
+        local hex = {}
+        for i = 0, math.min(n, 64) - 1 do
+            hex[#hex + 1] = string.format("%02X", buffer.readu8(v, i))
+        end
+        return "buffer(len=" .. n .. " hex=" .. table.concat(hex, " ") .. ")"
+    end
     if t == "table" then
         if depth >= 2 then return "{...}" end
         local parts, n = {}, 0
@@ -1403,6 +1410,7 @@ local function RecordCall(remote, args)
     local okName, full = pcall(function() return remote:GetFullName() end)
     if not okName then return end
     if full:find("AdminRemotes", 1, true) then return end
+    if remote.ClassName == "UnreliableRemoteEvent" then return end
     local parts = {}
     for i = 1, args.n do
         local ok, str = pcall(Ser, args[i], 0)
@@ -1420,11 +1428,14 @@ local function RecordCall(remote, args)
     table.insert(Recorder.Order, e)
 end
 
+Recorder.Fn = RecordCall
+
 local function StartRecording()
     if typeof(hookmetamethod) ~= "function" or typeof(getnamecallmethod) ~= "function" then
         return false, "Executor tidak mendukung hookmetamethod"
     end
     Recorder.Order, Recorder.Map = {}, {}
+    Recorder.Count = (Recorder.Count or 0) + 1
     if not Recorder.Hooked then
         local old
         local function handler(self, ...)
@@ -1434,7 +1445,7 @@ local function StartRecording()
                 if not mine then
                     Recorder.Busy = true
                     local args = table.pack(...)
-                    pcall(RecordCall, self, args)
+                    pcall(Recorder.Fn, self, args)
                     Recorder.Busy = false
                 end
             end
@@ -1452,12 +1463,12 @@ end
 
 local function StopAndSendRecording()
     Recorder.Active = false
-    local lines = {}
+    local lines = { "=== Rekaman #" .. tostring(Recorder.Count) .. " ===" }
     for _, e in ipairs(Recorder.Order) do
         table.insert(lines, "x" .. e.count .. "  " .. e.sig)
     end
     for _, l in ipairs(lines) do print("[Fluffy Hub] " .. l) end
-    if #lines == 0 then return false, "Tidak ada aksi terekam" end
+    if #lines <= 1 then lines[#lines + 1] = "(tidak ada remote terekam)" end
     return SendLinesToWebhook(lines)
 end
 Library.Maid:Add(function() Recorder.Active = false end)
